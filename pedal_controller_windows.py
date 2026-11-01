@@ -1382,7 +1382,8 @@ class PedalController:
             try:
                 self.keyboard.add_hotkey('ctrl+alt+shift+p', self.show_password_window)
                 self.keyboard.add_hotkey('ctrl+alt+shift+o', self.show_password_window)
-                logging.info("Горячие клавиши: ctrl+alt+shift+p / ctrl+alt+shift+o")
+                self.keyboard.add_hotkey('ctrl+alt+shift+s', lambda: self.root.after(0, self.show_settings_menu))
+                logging.info("Горячие клавиши: ctrl+alt+shift+p / ctrl+alt+shift+o (выход), ctrl+alt+shift+s (настройки)")
             except Exception as e:
                 logging.error(f"Ошибка настройки горячей клавиши: {e}")
 

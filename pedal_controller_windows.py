@@ -39,7 +39,7 @@ WARNING_MINUTES_BEFORE_ACTIVE = 5  # за сколько минут предуп
 ALERT_WINDOW_DELAY_SEC = 5  # секунд звукового предупреждения перед появлением большого окна
 
 DEFAULT_ADMIN_PASSWORD = "parent123"
-WHEEL_CIRCUMFERENCE = 2.0       # метры
+WHEEL_CIRCUMFERENCE = WHEEL_KM_CIRCUMFERENCE_M   # метры: колесо 19 дюймов
 PULSES_PER_REVOLUTION = 1
 
 FONT_TITLE_SIZE = 10

@@ -47,6 +47,10 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# Системную библиотеку C не кладём в exe: её копия с компьютера, где идёт сборка,
+# может оказаться новее системы на целевом ПК и ломать загрузку python312.dll.
+a.binaries = [b for b in a.binaries if os.path.basename(b[0]).lower() != 'ucrtbase.dll']
+
 pyz = PYZ(a.pure)
 
 exe = EXE(

@@ -6,8 +6,14 @@ import math
 import tkinter as tk
 from datetime import date, datetime
 
-WHEEL_DIAMETER_INCH = 19
-WHEEL_KM_CIRCUMFERENCE_M = math.pi * WHEEL_DIAMETER_INCH * 0.0254   # длина окружности колеса, м
+WHEEL_DIAMETER_INCH = 24     # стандартное детское колесо, около 61 см
+WHEEL_MIN_INCH = 10
+WHEEL_MAX_INCH = 32
+
+
+def wheel_circumference_m(inches):
+    """Путь за один оборот колеса диаметром `inches` дюймов, в метрах."""
+    return math.pi * inches * 0.0254
 
 HISTORY_MONTHS = 3
 MONTH_NAMES = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",

@@ -19,7 +19,10 @@ import shutil
 
 from version import __version__, GITHUB_REPO
 import updater
-from velo_welcome import WelcomeWindow, build_history, WHEEL_KM_CIRCUMFERENCE_M
+from velo_welcome import (
+    WelcomeWindow, build_history, WHEEL_DIAMETER_INCH, WHEEL_MIN_INCH, WHEEL_MAX_INCH,
+    wheel_circumference_m,
+)
 from velo_gauge import (
     SpeedGauge, Celebration, GAUGE_KEY, GAUGE_DEFAULT_SIZE, GAUGE_MIN_SIZE, GAUGE_MAX_SIZE,
     clamp_size, bottom_left_position, clamp_to_screen,
@@ -39,7 +42,6 @@ WARNING_MINUTES_BEFORE_ACTIVE = 5  # за сколько минут предуп
 ALERT_WINDOW_DELAY_SEC = 5  # секунд звукового предупреждения перед появлением большого окна
 
 DEFAULT_ADMIN_PASSWORD = "parent123"
-WHEEL_CIRCUMFERENCE = WHEEL_KM_CIRCUMFERENCE_M   # метры: колесо 19 дюймов
 PULSES_PER_REVOLUTION = 1
 
 FONT_TITLE_SIZE = 10
@@ -278,10 +280,12 @@ class PedalController:
 
         # Кружок-спидометр и праздничная анимация
         self.gauge_size = GAUGE_DEFAULT_SIZE
+        self.wheel_inches = WHEEL_DIAMETER_INCH
         self.gauge_canvas = None
         self.gauge_view = None
         self.title_bar = None
         self.celebration = None
+        self.celebration_due = False
         self.welcome = None
         self.welcome_pending = True
         self.daily_km = 0.0
@@ -788,6 +792,7 @@ class PedalController:
             'min_load': 3,
             'break_minutes': 60,
             'gauge_size': GAUGE_DEFAULT_SIZE,
+            'wheel_inches': WHEEL_DIAMETER_INCH,
             'schedule': DEFAULT_SCHEDULE.copy()
         }
 
@@ -807,6 +812,8 @@ class PedalController:
                 self.min_load = int(config.get('min_load', default_config['min_load']))
                 self.break_minutes = int(config.get('break_minutes', default_config['break_minutes']))
                 self.gauge_size = clamp_size(config.get('gauge_size', default_config['gauge_size']))
+                self.wheel_inches = max(WHEEL_MIN_INCH, min(WHEEL_MAX_INCH, float(
+                    config.get('wheel_inches', default_config['wheel_inches']))))
                 saved_schedule = config.get('schedule', {})
                 self.schedule = {
                     key: bool(saved_schedule.get(key, default_config['schedule'][key]))
@@ -848,6 +855,7 @@ class PedalController:
                 self.min_load = default_config['min_load']
                 self.break_minutes = default_config['break_minutes']
                 self.gauge_size = default_config['gauge_size']
+                self.wheel_inches = default_config['wheel_inches']
                 self.schedule = default_config['schedule'].copy()
                 self.save_config()
                 logging.info("Используются настройки по умолчанию")
@@ -860,6 +868,7 @@ class PedalController:
             self.min_load = default_config['min_load']
             self.break_minutes = default_config['break_minutes']
             self.gauge_size = default_config['gauge_size']
+            self.wheel_inches = default_config['wheel_inches']
             self.schedule = default_config['schedule'].copy()
 
     def save_config(self):
@@ -873,6 +882,7 @@ class PedalController:
                 'min_load': self.min_load,
                 'break_minutes': self.break_minutes,
                 'gauge_size': self.gauge_size,
+                'wheel_inches': self.wheel_inches,
                 'schedule': self.schedule
             }
 
@@ -1032,7 +1042,7 @@ class PedalController:
 
         # Пройденный путь: обороты колеса * длина окружности колеса 19 дюймов
         if self.current_rpm > 0:
-            self.daily_km += self.current_rpm / 60.0 * delta * WHEEL_KM_CIRCUMFERENCE_M / 1000.0
+            self.daily_km += self.current_rpm / 60.0 * delta * self.wheel_circumference / 1000.0
             if now - self._last_km_save >= 10:
                 self._last_km_save = now
                 self.save_daily_stats()
@@ -1050,7 +1060,7 @@ class PedalController:
                 self.is_limit_reached_today = True
                 logging.info(f"Дневной лимит {self.daily_limit_minutes} мин достигнут!")
                 self.save_daily_stats()
-                self.root.after(0, self.on_limit_reached)
+                self.celebration_due = True
 
             current_mark = int(self.daily_active_seconds)
             if current_mark % 10 == 0 and current_mark != self.last_stats_save_mark:
@@ -1312,7 +1322,7 @@ class PedalController:
             else:
                 rpm_check = (act * 60.0) / PULSES_PER_REVOLUTION
 
-            speed_check = rpm_check * WHEEL_CIRCUMFERENCE * 0.06
+            speed_check = rpm_check * self.wheel_circumference * 0.06
             load_check = self.current_load
 
             if speed_check >= self.min_speed and load_check >= self.min_load:
@@ -1346,7 +1356,7 @@ class PedalController:
             if self.pulse_times:
                 recent_rpms = [rpm for _, rpm in self.pulse_times[-3:]]
                 self.current_rpm = sum(recent_rpms) / len(recent_rpms)
-                self.current_speed = self.current_rpm * WHEEL_CIRCUMFERENCE * 0.06
+                self.current_speed = self.current_rpm * self.wheel_circumference * 0.06
 
             self.update_daily_activity()
         else:
@@ -1355,7 +1365,7 @@ class PedalController:
                 if self.pulse_times:
                     recent_rpms = [rpm for _, rpm in self.pulse_times[-3:]]
                     self.current_rpm = sum(recent_rpms) / len(recent_rpms)
-                    self.current_speed = self.current_rpm * WHEEL_CIRCUMFERENCE * 0.06
+                    self.current_speed = self.current_rpm * self.wheel_circumference * 0.06
                 else:
                     self.current_rpm = 0.0
                     self.current_speed = 0.0
@@ -1525,6 +1535,11 @@ class PedalController:
             self.welcome.close()
 
     # ==================== КРУЖОК-СПИДОМЕТР ====================
+
+    @property
+    def wheel_circumference(self):
+        """Длина окружности колеса, м (из диаметра в дюймах в настройках)."""
+        return wheel_circumference_m(self.wheel_inches)
 
     def enter_gauge_mode(self):
         """Сворачивает окно в круглый спидометр в левом нижнем углу видимой области."""
@@ -1740,6 +1755,11 @@ class PedalController:
 
         # Норматив выполнен: идёт праздник, затем приложение скрыто до завтра.
         if self.celebration is not None:
+            self.schedule_gui_update()
+            return
+        if self.celebration_due:
+            self.celebration_due = False
+            self.on_limit_reached()
             self.schedule_gui_update()
             return
         if self.is_limit_reached_today and self.is_today_scheduled():
@@ -2367,6 +2387,22 @@ class PedalController:
         tk.Entry(gauge_frame, textvariable=gauge_size_var, font=("Arial", 11), width=10).pack(side=tk.LEFT)
         tk.Label(gauge_frame, text=f"px ({GAUGE_MIN_SIZE}-{GAUGE_MAX_SIZE})", font=("Arial", 11), bg=bg_color).pack(side=tk.LEFT, padx=5)
 
+        wheel_frame = tk.Frame(lock_frame, bg=bg_color)
+        wheel_frame.pack(fill=tk.X, pady=5)
+
+        tk.Label(
+            wheel_frame,
+            text="Диаметр колеса:",
+            font=("Arial", 9),
+            bg=bg_color,
+            width=22,
+            anchor="w"
+        ).pack(side=tk.LEFT)
+
+        wheel_var = tk.StringVar(value=f"{self.wheel_inches:g}")
+        tk.Entry(wheel_frame, textvariable=wheel_var, font=("Arial", 11), width=10).pack(side=tk.LEFT)
+        tk.Label(wheel_frame, text=f"дюймов ({WHEEL_MIN_INCH}-{WHEEL_MAX_INCH}), 24 = 61 см", font=("Arial", 11), bg=bg_color).pack(side=tk.LEFT, padx=5)
+
         # === ДНЕВНОЙ ЛИМИТ ===
         daily_frame = tk.Frame(content_frame, bg=bg_color, relief="groove", bd=2, padx=15, pady=15)
         daily_frame.pack(fill=tk.X, pady=8)
@@ -2494,6 +2530,7 @@ class PedalController:
                 new_load = int(load_var.get())
                 new_break_minutes = int(break_minutes_var.get())
                 new_gauge_size = int(gauge_size_var.get())
+                new_wheel = float(wheel_var.get().replace(',', '.'))
                 new_schedule = {key: variable.get() for key, variable in schedule_vars.items()}
 
                 if new_speed < 0:
@@ -2540,8 +2577,17 @@ class PedalController:
                     )
                     return
 
+                if new_wheel < WHEEL_MIN_INCH or new_wheel > WHEEL_MAX_INCH:
+                    messagebox.showerror(
+                        "Ошибка",
+                        f"Диаметр колеса должен быть в диапазоне {WHEEL_MIN_INCH}-{WHEEL_MAX_INCH} дюймов!",
+                        parent=settings_window
+                    )
+                    return
+
                 old_limit_reached = self.is_limit_reached_today
                 self.gauge_size = new_gauge_size
+                self.wheel_inches = new_wheel
 
                 self.min_speed = new_speed
                 self.idle_timeout = new_timeout

@@ -1,0 +1,52 @@
+name: Release
+
+# Тег вида v4.1.0 запускает сборку VeloController.exe и публикацию релиза.
+# Программа на компьютерах сама находит новый релиз и обновляется.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Подставить версию и репозиторий
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}'.TrimStart('v')
+          $content = @(
+            '# version.py - создан при сборке релиза',
+            "__version__ = `"$version`"",
+            "GITHUB_REPO = `"${{ github.repository }}`"",
+            'RELEASE_ASSET_NAME = "VeloController.exe"'
+          )
+          Set-Content -Path version.py -Value $content -Encoding utf8
+
+      - name: Установить зависимости
+        run: pip install -r requirements.txt
+
+      - name: Собрать exe
+        run: pyinstaller velocontroller.spec --noconfirm --distpath dist --workpath build-tmp
+
+      - name: Контрольная сумма
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\VeloController.exe -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path dist\VeloController.exe.sha256 -Value "$hash  VeloController.exe" -Encoding ascii
+
+      - name: Опубликовать релиз
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/VeloController.exe
+            dist/VeloController.exe.sha256
+          generate_release_notes: true

@@ -1,0 +1,4 @@
+pyserial
+keyboard
+pywin32
+pyinstaller

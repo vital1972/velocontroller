@@ -76,15 +76,28 @@ WEEKDAYS = (
 DEFAULT_SCHEDULE = {key: True for key, _ in WEEKDAYS}
 
 # ==================== ЛОГИРОВАНИЕ ====================
+LOG_MAX_BYTES = 1_000_000
+LOG_BACKUP_COUNT = 2
+
+
 def setup_logging():
-    """Настраивает логирование в файл."""
+    """Настраивает логирование в файл с ротацией (не больше ~3 МБ всего)."""
+    from logging.handlers import RotatingFileHandler
+
     os.makedirs(BASE_DIR, exist_ok=True)
-    logging.basicConfig(
-        filename=LOG_FILE,
-        level=logging.DEBUG,
-        format='%(asctime)s [%(levelname)s] %(message)s',
-        encoding='utf-8'
-    )
+
+    # Файлы от старых версий могли разрастись до сотен мегабайт - удаляем.
+    for path in (LOG_FILE, LOG_FILE + '.1', LOG_FILE + '.2'):
+        try:
+            if os.path.exists(path) and os.path.getsize(path) > 5 * LOG_MAX_BYTES:
+                os.remove(path)
+        except OSError:
+            pass
+
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT,
+                                  encoding='utf-8')
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s'))
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     logging.info("=" * 60)
     logging.info("Запуск логгера ВЕЛО-КОНТРОЛЛЕРА (режим ожидания)")
     logging.info("=" * 60)

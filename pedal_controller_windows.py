@@ -19,6 +19,7 @@ import shutil
 
 from version import __version__, GITHUB_REPO
 import updater
+import velo_freetime as ft
 from velo_welcome import (
     WelcomeWindow, build_history, WHEEL_DIAMETER_INCH, WHEEL_MIN_INCH, WHEEL_MAX_INCH,
     wheel_circumference_m,
@@ -299,6 +300,8 @@ class PedalController:
         self.title_bar = None
         self.celebration = None
         self.celebration_due = False
+        self.free_windows = []
+        self._in_free_window = False
         self.welcome = None
         self.welcome_pending = True
         self.daily_km = 0.0
@@ -806,6 +809,7 @@ class PedalController:
             'break_minutes': 60,
             'gauge_size': GAUGE_DEFAULT_SIZE,
             'wheel_inches': WHEEL_DIAMETER_INCH,
+            'free_windows': [],
             'schedule': DEFAULT_SCHEDULE.copy()
         }
 
@@ -827,6 +831,7 @@ class PedalController:
                 self.gauge_size = clamp_size(config.get('gauge_size', default_config['gauge_size']))
                 self.wheel_inches = max(WHEEL_MIN_INCH, min(WHEEL_MAX_INCH, float(
                     config.get('wheel_inches', default_config['wheel_inches']))))
+                self.free_windows = ft.normalize_windows(config.get('free_windows', []))
                 saved_schedule = config.get('schedule', {})
                 self.schedule = {
                     key: bool(saved_schedule.get(key, default_config['schedule'][key]))
@@ -869,6 +874,7 @@ class PedalController:
                 self.break_minutes = default_config['break_minutes']
                 self.gauge_size = default_config['gauge_size']
                 self.wheel_inches = default_config['wheel_inches']
+                self.free_windows = []
                 self.schedule = default_config['schedule'].copy()
                 self.save_config()
                 logging.info("Используются настройки по умолчанию")
@@ -882,6 +888,7 @@ class PedalController:
             self.break_minutes = default_config['break_minutes']
             self.gauge_size = default_config['gauge_size']
             self.wheel_inches = default_config['wheel_inches']
+            self.free_windows = []
             self.schedule = default_config['schedule'].copy()
 
     def save_config(self):
@@ -896,6 +903,7 @@ class PedalController:
                 'break_minutes': self.break_minutes,
                 'gauge_size': self.gauge_size,
                 'wheel_inches': self.wheel_inches,
+                'free_windows': self.free_windows,
                 'schedule': self.schedule
             }
 
@@ -909,6 +917,10 @@ class PedalController:
         """True, если по расписанию сегодня требуется выполнить норму."""
         weekday_key = WEEKDAYS[datetime.now().weekday()][0]
         return bool(self.schedule.get(weekday_key, True))
+
+    def is_free_window_now(self):
+        """True, если сейчас действует свободный промежуток (педали крутить не нужно)."""
+        return ft.is_free_now(self.free_windows, datetime.now())
 
     def get_scheduled_day_names(self):
         names = [name for key, name in WEEKDAYS if self.schedule.get(key, False)]
@@ -1824,6 +1836,29 @@ class PedalController:
             self.schedule_gui_update()
             return
 
+        # Свободный промежуток из настроек: как выходной, но только на заданные часы.
+        if self.is_free_window_now():
+            self._in_free_window = True
+            self.stop_beep_warning()
+            self.alert_window_start_time = None
+            self.set_window_normal()
+            self.speed_label.config(text=f"{self.current_speed:.1f}", foreground="green")
+            self.load_label.config(text=f"Нагр: {self.current_load} / мин: {self.min_load}")
+            self.pulses_label.config(text=f"{self.session_pulses}")
+            self.daily_progress_label.config(text="Свободное время")
+            until = ft.free_until(self.free_windows, datetime.now())
+            self.break_timer_label.config(text=f"Без нагрузки до {until}", fg="green")
+            self.beep_timer_label.config(text="Отдых", fg="green")
+            self.status_label.config(text="Свободное время")
+            self.status_canvas.itemconfig(self.status_indicator, fill="green")
+            self.schedule_gui_update()
+            return
+        if self._in_free_window:
+            # Промежуток закончился: даём минуту на то, чтобы начать крутить, и показываем приветствие.
+            self._in_free_window = False
+            self.last_activity_time = time.time() + 60
+            self.welcome_pending = True
+
         # Обновляем состояние режима ожидания
         self.update_break_mode()
 
@@ -2500,6 +2535,75 @@ class PedalController:
                 anchor="w"
             ).grid(row=index // 2, column=index % 2, sticky="w", padx=(0, 35), pady=2)
 
+        # === СВОБОДНЫЕ ПРОМЕЖУТКИ ВРЕМЕНИ ===
+        free_state = list(self.free_windows)
+        free_frame = tk.Frame(content_frame, bg=bg_color, relief="groove", bd=2, padx=15, pady=12)
+        free_frame.pack(fill=tk.X, pady=8)
+
+        tk.Label(
+            free_frame,
+            text="Свободные промежутки (педали крутить не нужно)",
+            font=("Arial", 9, "bold"),
+            bg=bg_color
+        ).pack(anchor="w", pady=(0, 5))
+
+        tk.Label(
+            free_frame,
+            text="Выберите день и время (ЧЧ:ММ). В это время нет контроля и блокировки:",
+            font=("Arial", 8),
+            bg=bg_color,
+            fg="gray"
+        ).pack(anchor="w", pady=(0, 5))
+
+        free_list = tk.Listbox(free_frame, height=4, font=("Arial", 10), exportselection=False)
+        free_list.pack(fill=tk.X, pady=(0, 5))
+
+        def refresh_free_list():
+            free_list.delete(0, tk.END)
+            for window in free_state:
+                free_list.insert(tk.END, ft.window_label(window))
+
+        refresh_free_list()
+
+        free_controls = tk.Frame(free_frame, bg=bg_color)
+        free_controls.pack(fill=tk.X)
+
+        day_choices = [ft.DAY_ALL_NAME] + list(ft.DAY_NAMES)
+        free_day_var = tk.StringVar(value=day_choices[0])
+        ttk.Combobox(free_controls, textvariable=free_day_var, values=day_choices,
+                     state="readonly", width=14).pack(side=tk.LEFT)
+        free_start_var = tk.StringVar(value="10:00")
+        free_end_var = tk.StringVar(value="14:00")
+        tk.Entry(free_controls, textvariable=free_start_var, font=("Arial", 11), width=6).pack(side=tk.LEFT, padx=(8, 2))
+        tk.Label(free_controls, text="–", bg=bg_color).pack(side=tk.LEFT)
+        tk.Entry(free_controls, textvariable=free_end_var, font=("Arial", 11), width=6).pack(side=tk.LEFT, padx=(2, 8))
+
+        def add_free_window():
+            chosen = free_day_var.get()
+            day_key = ft.DAY_ALL if chosen == ft.DAY_ALL_NAME else ft.DAY_KEYS[ft.DAY_NAMES.index(chosen)]
+            window = ft.normalize_windows([{
+                'day': day_key, 'start': free_start_var.get(), 'end': free_end_var.get()
+            }])
+            if not window:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Укажите время в формате ЧЧ:ММ, начало должно быть раньше конца (в пределах суток).",
+                    parent=settings_window
+                )
+                return
+            if window[0] not in free_state:
+                free_state.append(window[0])
+                refresh_free_list()
+
+        def delete_free_window():
+            selection = free_list.curselection()
+            if selection:
+                del free_state[selection[0]]
+                refresh_free_list()
+
+        tk.Button(free_controls, text="Добавить", command=add_free_window).pack(side=tk.LEFT, padx=2)
+        tk.Button(free_controls, text="Удалить выбранное", command=delete_free_window).pack(side=tk.LEFT, padx=2)
+
         # === ТЕКУЩАЯ СТАТИСТИКА ===
         info_frame = tk.Frame(content_frame, bg="#e0e0e0", relief="sunken", bd=2, padx=15, pady=15)
         info_frame.pack(fill=tk.X, pady=5)
@@ -2608,6 +2712,7 @@ class PedalController:
                 self.daily_limit_minutes = new_limit
                 self.min_load = new_load
                 self.schedule = new_schedule
+                self.free_windows = ft.normalize_windows(free_state)
                 
                 # Если свободное время изменилось, запускаем новый отсчет текущего дня.
                 if new_break_minutes != self.break_minutes:
@@ -2929,6 +3034,7 @@ class PedalController:
                 or self.is_break_mode
                 or self.is_manual_pause_active()
                 or not self.is_today_scheduled()
+                or self.is_free_window_now()
                 or self.is_password_window_open):
             logging.info(
                 "Блокировка отменена: locked=%s, limit=%s, break=%s, pause=%s, scheduled=%s, password=%s",

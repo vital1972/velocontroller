@@ -304,6 +304,7 @@ class PedalController:
         self._in_free_window = False
         self.welcome = None
         self.welcome_pending = True
+        self.startup_welcome_due = True
         self.daily_km = 0.0
         self._last_km_save = time.time()
         self._saved_pos = (0, 0)
@@ -1570,7 +1571,7 @@ class PedalController:
     def enter_gauge_mode(self):
         """Сворачивает окно в круглый спидометр в левом нижнем углу видимой области."""
         size = clamp_size(self.gauge_size)
-        self.close_welcome()
+        self.welcome_pending = False
         if self.window_current_mode == "gauge":
             if self.gauge_canvas.winfo_reqwidth() != size:
                 self.gauge_canvas.config(width=size, height=size)
@@ -1795,6 +1796,11 @@ class PedalController:
             return
         if self.window_current_mode == "hidden":
             self.show_from_hidden()
+
+        # Приветствие с историей при запуске программы - даже в режиме свободного времени.
+        if self.startup_welcome_due and not self.is_locked:
+            self.startup_welcome_due = False
+            self.show_welcome()
 
         if self.is_manual_pause_active():
             remaining = self.get_manual_pause_remaining_seconds()

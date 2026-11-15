@@ -95,12 +95,16 @@ class WelcomeWindow:
     STAT_COLOR = "#1e9e3a"
     TODAY_BORDER = "#2b78b8"
 
-    def __init__(self, root, history, goal_text, on_close=None):
+    def __init__(self, root, history, goal_text, on_close=None, auto_close_sec=30):
         self.root = root
         self.history = history
         self.goal_text = goal_text
         self.on_close = on_close
         self.win = None
+        self.auto_close_sec = auto_close_sec
+        self._left = auto_close_sec
+        self._countdown_label = None
+        self._after_id = None
 
     def show(self):
         win = tk.Toplevel(self.root)
@@ -140,12 +144,26 @@ class WelcomeWindow:
                  bg=self.BG, fg="#d99a00").pack(pady=(6, 2))
         tk.Button(win, text="Поехали!", font=("Arial", 12, "bold"), command=self.close,
                   bg="#2b78b8", fg="white", activebackground="#1f5f94", bd=0,
-                  padx=24, pady=6).pack(pady=(6, 16))
+                  padx=24, pady=6).pack(pady=(6, 4))
+        self._countdown_label = tk.Label(win, text="", font=("Arial", 9), bg=self.BG, fg="#777")
+        self._countdown_label.pack(pady=(0, 12))
+        if self.auto_close_sec:
+            self._tick()
 
         win.update_idletasks()
         x = (win.winfo_screenwidth() - win.winfo_width()) // 2
         y = max(0, (win.winfo_screenheight() - win.winfo_height()) // 3)
         win.geometry(f"+{x}+{y}")
+
+    def _tick(self):
+        if self.win is None:
+            return
+        if self._left <= 0:
+            self.close()
+            return
+        self._countdown_label.config(text=f"Окно закроется само через {self._left} с")
+        self._left -= 1
+        self._after_id = self.win.after(1000, self._tick)
 
     def _month_frame(self, parent, month):
         frame = tk.Frame(parent, bg="white", bd=1, relief="solid")
@@ -181,6 +199,8 @@ class WelcomeWindow:
         win, self.win = self.win, None
         if win is not None:
             try:
+                if self._after_id is not None:
+                    win.after_cancel(self._after_id)
                 win.destroy()
             except Exception:
                 pass

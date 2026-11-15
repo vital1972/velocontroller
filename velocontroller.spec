@@ -20,6 +20,7 @@ hiddenimports += collect_submodules('serial')
 hiddenimports += collect_submodules('keyboard')
 
 datas = [
+    ('heroes', 'heroes'),
     (os.path.join(tcl_root, 'tcl8.6'), os.path.join('tcl', 'tcl8.6')),
     (os.path.join(tcl_root, 'tk8.6'), os.path.join('tcl', 'tk8.6')),
 ]

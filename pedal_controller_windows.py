@@ -21,6 +21,7 @@ from version import __version__, GITHUB_REPO
 import updater
 import velo_freetime as ft
 from velo_cheers import CheerWindow, pick_cheer, format_cheer, DEFAULT_CHILD_NAME
+from velo_input import seconds_since_last_input
 from velo_welcome import (
     WelcomeWindow, build_history, WHEEL_DIAMETER_INCH, WHEEL_MIN_INCH, WHEEL_MAX_INCH,
     wheel_circumference_m,
@@ -36,6 +37,9 @@ STARTUP_DELAY_SEC = 30
 CHECK_INTERVAL_SEC = 5
 SERIAL_READ_SLEEP = 0.05
 MIN_IDLE_TIMEOUT_SEC = 10
+CHEER_IDLE_DEFAULT_SEC = 5   # пауза без клавиатуры и мыши перед поздравлением
+CHEER_IDLE_MIN_SEC = 1
+CHEER_IDLE_MAX_SEC = 120
 MIN_DAILY_LIMIT_MIN = 1
 MIN_BREAK_MINUTES = 1  # минимальное время режима ожидания
 MAX_BREAK_MINUTES = 480  # максимальное (8 часов)
@@ -306,6 +310,8 @@ class PedalController:
         self.child_name = DEFAULT_CHILD_NAME
         self.cheer = None
         self._last_cheer_hero = None
+        self.cheer_idle_sec = CHEER_IDLE_DEFAULT_SEC
+        self.cheer_pending = False
         self.welcome = None
         self.welcome_pending = True
         self.startup_welcome_due = True
@@ -816,6 +822,7 @@ class PedalController:
             'wheel_inches': WHEEL_DIAMETER_INCH,
             'free_windows': [],
             'child_name': DEFAULT_CHILD_NAME,
+            'cheer_idle_sec': CHEER_IDLE_DEFAULT_SEC,
             'schedule': DEFAULT_SCHEDULE.copy()
         }
 
@@ -839,6 +846,8 @@ class PedalController:
                     config.get('wheel_inches', default_config['wheel_inches']))))
                 self.free_windows = ft.normalize_windows(config.get('free_windows', []))
                 self.child_name = str(config.get('child_name', DEFAULT_CHILD_NAME)).strip()[:30] or DEFAULT_CHILD_NAME
+                self.cheer_idle_sec = max(CHEER_IDLE_MIN_SEC, min(CHEER_IDLE_MAX_SEC, int(
+                    config.get('cheer_idle_sec', default_config['cheer_idle_sec']))))
                 saved_schedule = config.get('schedule', {})
                 self.schedule = {
                     key: bool(saved_schedule.get(key, default_config['schedule'][key]))
@@ -883,6 +892,7 @@ class PedalController:
                 self.wheel_inches = default_config['wheel_inches']
                 self.free_windows = []
                 self.child_name = DEFAULT_CHILD_NAME
+                self.cheer_idle_sec = CHEER_IDLE_DEFAULT_SEC
                 self.schedule = default_config['schedule'].copy()
                 self.save_config()
                 logging.info("Используются настройки по умолчанию")
@@ -898,6 +908,7 @@ class PedalController:
             self.wheel_inches = default_config['wheel_inches']
             self.free_windows = []
             self.child_name = DEFAULT_CHILD_NAME
+            self.cheer_idle_sec = CHEER_IDLE_DEFAULT_SEC
             self.schedule = default_config['schedule'].copy()
 
     def save_config(self):
@@ -914,6 +925,7 @@ class PedalController:
                 'wheel_inches': self.wheel_inches,
                 'free_windows': self.free_windows,
                 'child_name': self.child_name,
+                'cheer_idle_sec': self.cheer_idle_sec,
                 'schedule': self.schedule
             }
 
@@ -1643,6 +1655,14 @@ class PedalController:
             ok, lock_frac, self.daily_active_seconds // 60, remaining, idle_state
         )
 
+    def show_done_gauge(self):
+        """Норма выполнена, но поздравление ждёт паузы: спокойный зелёный кружок без сигналов."""
+        self.enter_gauge_mode()
+        self.gauge_view.draw(
+            clamp_size(self.gauge_size), self.current_speed, self.min_speed,
+            True, 0.0, self.daily_active_seconds // 60, 0.0, False
+        )
+
     def hide_for_today(self):
         """Прячет приложение до следующего дня (или до изменения норматива)."""
         if self.window_current_mode == "hidden":
@@ -1677,7 +1697,7 @@ class PedalController:
     def _celebration_done(self):
         self.celebration = None
         self.hide_for_today()
-        self.show_cheer()
+        self.cheer_pending = True
 
     def show_cheer(self, child_name=None, after_close=None):
         """Окно со случайным героем и юмористическим поздравлением."""
@@ -1814,11 +1834,25 @@ class PedalController:
         if self.celebration is not None:
             self.schedule_gui_update()
             return
+        if (self.cheer_pending and self.celebration is None
+                and seconds_since_last_input() >= self.cheer_idle_sec):
+            self.cheer_pending = False
+            self.show_cheer()
         if self.celebration_due:
-            self.celebration_due = False
-            self.on_limit_reached()
-            self.schedule_gui_update()
-            return
+            if not self.is_limit_reached_today:
+                self.celebration_due = False
+            elif seconds_since_last_input() >= self.cheer_idle_sec:
+                # Ребёнок перестал нажимать клавиши и двигать мышь - можно поздравлять.
+                self.celebration_due = False
+                self.on_limit_reached()
+                self.schedule_gui_update()
+                return
+            else:
+                # Норма выполнена, но он ещё играет: контроль снят, поздравление ждёт паузы.
+                self.stop_beep_warning()
+                self.show_done_gauge()
+                self.schedule_gui_update()
+                return
         if self.is_limit_reached_today and self.is_today_scheduled():
             self.stop_beep_warning()
             self.hide_for_today()
@@ -2516,6 +2550,23 @@ class PedalController:
 
         tk.Button(name_frame, text="Показать пример", command=preview_cheer).pack(side=tk.LEFT, padx=8)
 
+        cheer_idle_frame = tk.Frame(lock_frame, bg=bg_color)
+        cheer_idle_frame.pack(fill=tk.X, pady=5)
+
+        tk.Label(
+            cheer_idle_frame,
+            text="Поздравление после паузы:",
+            font=("Arial", 9),
+            bg=bg_color,
+            width=22,
+            anchor="w"
+        ).pack(side=tk.LEFT)
+
+        cheer_idle_var = tk.StringVar(value=str(self.cheer_idle_sec))
+        tk.Entry(cheer_idle_frame, textvariable=cheer_idle_var, font=("Arial", 11), width=10).pack(side=tk.LEFT)
+        tk.Label(cheer_idle_frame, text=f"сек без клавиатуры и мыши ({CHEER_IDLE_MIN_SEC}-{CHEER_IDLE_MAX_SEC})",
+                 font=("Arial", 11), bg=bg_color).pack(side=tk.LEFT, padx=5)
+
         # === ДНЕВНОЙ ЛИМИТ ===
         daily_frame = tk.Frame(content_frame, bg=bg_color, relief="groove", bd=2, padx=15, pady=15)
         daily_frame.pack(fill=tk.X, pady=8)
@@ -2714,6 +2765,7 @@ class PedalController:
                 new_gauge_size = int(gauge_size_var.get())
                 new_wheel = float(wheel_var.get().replace(',', '.'))
                 new_child_name = child_name_var.get().strip()[:30] or DEFAULT_CHILD_NAME
+                new_cheer_idle = int(cheer_idle_var.get())
                 new_schedule = {key: variable.get() for key, variable in schedule_vars.items()}
 
                 if new_speed < 0:
@@ -2768,8 +2820,17 @@ class PedalController:
                     )
                     return
 
+                if new_cheer_idle < CHEER_IDLE_MIN_SEC or new_cheer_idle > CHEER_IDLE_MAX_SEC:
+                    messagebox.showerror(
+                        "Ошибка",
+                        f"Пауза перед поздравлением должна быть {CHEER_IDLE_MIN_SEC}-{CHEER_IDLE_MAX_SEC} сек!",
+                        parent=settings_window
+                    )
+                    return
+
                 old_limit_reached = self.is_limit_reached_today
                 self.gauge_size = new_gauge_size
+                self.cheer_idle_sec = new_cheer_idle
                 self.wheel_inches = new_wheel
                 self.child_name = new_child_name
 

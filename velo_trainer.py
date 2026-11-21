@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 
 PROGRAMDATA_DIR = os.environ.get('PROGRAMDATA', 'C:\\ProgramData')
 TRAINER_STATE_FILE = os.path.join(PROGRAMDATA_DIR, 'DetectiveOshibkin', 'state.json')
@@ -68,8 +68,10 @@ def write_own_state(state, path=OWN_STATE_FILE, now=None):
     """Пишет файл велоконтроллера атомарно (временный файл, затем переименование)."""
     if state not in OWN_STATES:
         raise ValueError(state)
-    now = now or datetime.now().astimezone()
-    payload = {'version': 1, 'state': state, 'heartbeat': now.isoformat(timespec='seconds')}
+    now = now or datetime.now(timezone.utc)
+    # heartbeat - UTC в формате ISO 8601 с Z, например 2026-11-21T16:18:30Z
+    heartbeat = now.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+    payload = {'version': 1, 'state': state, 'heartbeat': heartbeat}
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='state.', suffix='.tmp', dir=directory)

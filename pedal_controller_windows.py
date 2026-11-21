@@ -22,6 +22,7 @@ import updater
 import velo_freetime as ft
 from velo_cheers import CheerWindow, pick_cheer, format_cheer, DEFAULT_CHILD_NAME
 from velo_input import seconds_since_last_input
+import velo_trainer as vt
 from velo_welcome import (
     WelcomeWindow, build_history, WHEEL_DIAMETER_INCH, WHEEL_MIN_INCH, WHEEL_MAX_INCH,
     wheel_circumference_m,
@@ -43,6 +44,8 @@ CHEER_IDLE_MAX_SEC = 120
 DEBT_RECOVERY_DEFAULT = 0.5  # сколько секунд паузы гасит 1 секунда нормального кручения
 DEBT_RECOVERY_MIN = 0.1
 DEBT_RECOVERY_MAX = 20.0
+START_IDLE_DEFAULT_SEC = 5   # пауза без клавиатуры и мыши перед стартом контроля
+TRAINER_PAUSE_MAX_SEC = 1800  # страховка: одна сессия тренажёра не держит паузу дольше 30 минут
 MIN_DAILY_LIMIT_MIN = 1
 MIN_BREAK_MINUTES = 1  # минимальное время режима ожидания
 MAX_BREAK_MINUTES = 480  # максимальное (8 часов)
@@ -318,6 +321,22 @@ class PedalController:
         self._last_cheer_hero = None
         self.cheer_idle_sec = CHEER_IDLE_DEFAULT_SEC
         self.cheer_pending = False
+        self.start_idle_sec = START_IDLE_DEFAULT_SEC
+        self._start_wait = False
+        self._pause_ending = False
+        self._quiet_hidden = False
+        self.paused_by_trainer = False
+        self._trainer_poll_at = 0.0
+        self._trainer_status = vt.NONE
+        self._pause_session = None
+        self._pause_started = 0.0
+        self._pause_tick = 0.0
+        self._pause_last_save = 0.0
+        self._pause_geom = None
+        self._ignored_session = None
+        self._own_state = None
+        self._own_state_at = 0.0
+        self._trainer_broken_logged = False
         self.welcome = None
         self.welcome_pending = True
         self.startup_welcome_due = True
@@ -399,6 +418,11 @@ class PedalController:
 
         if self.is_limit_reached_today and self.is_today_scheduled():
             self.hide_for_today()
+
+        if not self.start_gate_open():
+            self._start_wait = True
+            self._quiet_hide()
+            logging.info("Запуск во время игры: скрываюсь до паузы без клавиш и мыши")
 
         self.start_auto_update()
 
@@ -660,6 +684,8 @@ class PedalController:
         if not self.manual_pause_until:
             return False
         if time.time() >= self.manual_pause_until:
+            if not self.start_gate_open():
+                return True            # перерыв кончился, но ребёнок играет: контроль ещё не стартует
             self.manual_pause_until = None
             if self.pending_break_start_date == time.strftime("%Y-%m-%d"):
                 self.start_break_mode_for_today(reason="завершился ночной ручной перерыв, запускаю дневное свободное время", save_state=False)
@@ -711,13 +737,14 @@ class PedalController:
         if self.is_warning_mode:
             # Предупреждение не создаёт отдельный пятиминутный таймер.
             # Активация всегда происходит ровно по окончании break_minutes.
-            if elapsed >= break_seconds:
+            if elapsed >= break_seconds and self.start_gate_open():
                 self.activate_control_mode("завершился период свободного времени")
             return
         
         # Проверяем, не пора ли показать предупреждение
         remaining = break_seconds - elapsed
-        if remaining <= WARNING_MINUTES_BEFORE_ACTIVE * 60 and remaining > 0 and not self.warning_shown:
+        if (remaining <= WARNING_MINUTES_BEFORE_ACTIVE * 60 and remaining > 0 and not self.warning_shown
+                and self.start_gate_open()):
             self.is_warning_mode = True
             self.warning_time = now
             self.warning_shown = True
@@ -726,7 +753,7 @@ class PedalController:
             self.save_break_state()
         
         # Если время вышло и не в режиме предупреждения (на всякий случай)
-        if elapsed >= break_seconds and not self.is_warning_mode:
+        if elapsed >= break_seconds and not self.is_warning_mode and self.start_gate_open():
             self.activate_control_mode("завершился период свободного времени")
 
     def minimize_window(self):
@@ -832,6 +859,7 @@ class PedalController:
             'child_name': DEFAULT_CHILD_NAME,
             'cheer_idle_sec': CHEER_IDLE_DEFAULT_SEC,
             'debt_recovery': DEBT_RECOVERY_DEFAULT,
+            'start_idle_sec': START_IDLE_DEFAULT_SEC,
             'schedule': DEFAULT_SCHEDULE.copy()
         }
 
@@ -859,6 +887,8 @@ class PedalController:
                     config.get('cheer_idle_sec', default_config['cheer_idle_sec']))))
                 self.debt_recovery = max(DEBT_RECOVERY_MIN, min(DEBT_RECOVERY_MAX, float(
                     config.get('debt_recovery', default_config['debt_recovery']))))
+                self.start_idle_sec = max(CHEER_IDLE_MIN_SEC, min(CHEER_IDLE_MAX_SEC, int(
+                    config.get('start_idle_sec', default_config['start_idle_sec']))))
                 saved_schedule = config.get('schedule', {})
                 self.schedule = {
                     key: bool(saved_schedule.get(key, default_config['schedule'][key]))
@@ -905,6 +935,7 @@ class PedalController:
                 self.child_name = DEFAULT_CHILD_NAME
                 self.cheer_idle_sec = CHEER_IDLE_DEFAULT_SEC
                 self.debt_recovery = DEBT_RECOVERY_DEFAULT
+                self.start_idle_sec = START_IDLE_DEFAULT_SEC
                 self.schedule = default_config['schedule'].copy()
                 self.save_config()
                 logging.info("Используются настройки по умолчанию")
@@ -922,6 +953,7 @@ class PedalController:
             self.child_name = DEFAULT_CHILD_NAME
             self.cheer_idle_sec = CHEER_IDLE_DEFAULT_SEC
             self.debt_recovery = DEBT_RECOVERY_DEFAULT
+            self.start_idle_sec = START_IDLE_DEFAULT_SEC
             self.schedule = default_config['schedule'].copy()
 
     def save_config(self):
@@ -940,6 +972,7 @@ class PedalController:
                 'child_name': self.child_name,
                 'cheer_idle_sec': self.cheer_idle_sec,
                 'debt_recovery': self.debt_recovery,
+                'start_idle_sec': self.start_idle_sec,
                 'schedule': self.schedule
             }
 
@@ -1683,6 +1716,159 @@ class PedalController:
             ok, lock_frac, self.daily_active_seconds // 60, remaining, idle_state
         )
 
+    # ==================== ТРЕНАЖЁР «ДЕТЕКТИВ ОШИБКИН» ====================
+
+    def start_gate_open(self):
+        """True, если ребёнок не нажимал клавиши и не двигал мышь start_idle_sec секунд.
+
+        Контроль, окна и приветствие стартуют только тогда, чтобы не врываться в игру.
+        """
+        return seconds_since_last_input() >= self.start_idle_sec
+
+    def _quiet_hide(self):
+        """Прячет окно (прозрачное, 1x1), пока контроль не имеет права появляться."""
+        if self._quiet_hidden or self.window_current_mode == "hidden":
+            return
+        try:
+            self.root.update_idletasks()
+            self._pause_geom = self.root.geometry()
+            self.root.attributes('-alpha', 0.0)
+            self.root.geometry("1x1+0+0")
+            self._quiet_hidden = True
+        except Exception as e:
+            logging.warning(f"Не удалось скрыть окно: {e}")
+
+    def _quiet_show(self):
+        if not self._quiet_hidden or self._start_wait or self.paused_by_trainer:
+            return
+        self._quiet_hidden = False
+        if self.window_current_mode == "hidden":
+            return
+        try:
+            self.root.attributes('-alpha', 1.0)
+            if self._pause_geom:
+                self.root.geometry(self._pause_geom)
+        except Exception as e:
+            logging.warning(f"Не удалось вернуть окно: {e}")
+
+    def is_free_period(self):
+        """Свободный промежуток идёт или только что кончился, а ребёнок ещё играет."""
+        if self.is_free_window_now():
+            return True
+        return self._in_free_window and not self.start_gate_open()
+
+    def poll_trainer(self):
+        """Раз в секунду читает файл тренажёра и включает/выключает паузу."""
+        now = time.time()
+        if now - self._trainer_poll_at < vt.TRAINER_POLL_SEC:
+            return
+        self._trainer_poll_at = now
+
+        info = vt.read_trainer_state()
+        status = info['status']
+        if status == vt.BROKEN:
+            if not self._trainer_broken_logged:
+                logging.warning("Файл тренажёра не разобран - работаю как обычно")
+                self._trainer_broken_logged = True
+        else:
+            self._trainer_broken_logged = False
+        if status != self._trainer_status:
+            logging.info(f"Состояние тренажёра: {self._trainer_status} -> {status}, session_id={info['session_id']}")
+            self._trainer_status = status
+
+        sid = info['session_id']
+        want_pause = status == vt.SESSION and sid != self._ignored_session
+        if status != vt.SESSION:
+            self._ignored_session = None
+
+        if want_pause and self.paused_by_trainer:
+            self._pause_ending = False
+        if want_pause and not self.paused_by_trainer:
+            self._pause_begin(sid)
+        elif not want_pause and self.paused_by_trainer:
+            if not self.start_gate_open() and now - self._pause_started <= TRAINER_PAUSE_MAX_SEC:
+                # Занятие кончилось, но ребёнок играет: не врываемся, ждём паузы в игре.
+                if not self._pause_ending:
+                    logging.info(f"Занятие закончено, жду паузы в игре, session_id={self._pause_session}")
+                self._pause_ending = True
+                return
+            reason = {vt.STALE: "heartbeat устарел (тренажёр закрыт?)", vt.NONE: "файл исчез",
+                      vt.BROKEN: "файл повреждён", vt.IDLE: "занятие закончено",
+                      vt.WARNING: "занятие закончено"}.get(status, "сессия закончена")
+            self._pause_end(reason)
+        elif self.paused_by_trainer and now - self._pause_started > TRAINER_PAUSE_MAX_SEC:
+            logging.warning(f"Пауза сессии {self._pause_session} дольше {TRAINER_PAUSE_MAX_SEC} с - выхожу из паузы")
+            self._ignored_session = self._pause_session
+            self._pause_end("слишком долгая пауза")
+
+    def _pause_begin(self, session_id):
+        self.paused_by_trainer = True
+        self._pause_session = session_id
+        self._pause_started = self._pause_tick = self._pause_last_save = time.time()
+        self.stop_beep_warning()
+        self.close_welcome()
+        if self.cheer is not None:
+            self.cheer.close()
+        if self.celebration is not None:
+            self.celebration.finish()
+        self._quiet_hide()
+        logging.info(f"Пауза: идёт занятие в тренажёре, session_id={session_id}")
+
+    def _pause_end(self, reason):
+        sid = self._pause_session
+        seconds = time.time() - self._pause_started
+        self.paused_by_trainer = False
+        self._pause_ending = False
+        self._pause_session = None
+        self._quiet_show()
+        now = time.time()
+        self._debt_tick = now
+        self.last_daily_update_time = now
+        self.save_break_state()
+        logging.info(f"Продолжаю: {reason}, session_id={sid}, пауза {seconds:.0f} с")
+
+    def run_trainer_pause(self):
+        """Во время занятия все таймеры стоят: час отдыха, пауза-долг, отсчёт без вращения."""
+        now = time.time()
+        dt = max(0.0, min(now - self._pause_tick, 1.0))
+        self._pause_tick = now
+        if self._pause_ending:           # занятие кончилось: тихо ждём паузы, таймеры уже идут
+            self.stop_beep_warning()
+            return
+        self.break_start_time += dt
+        if self.warning_time:
+            try:
+                self.warning_time = float(self.warning_time) + dt
+            except (TypeError, ValueError):
+                pass
+        self.last_leg_movement_time = min(now, self.last_leg_movement_time + dt)
+        self.last_daily_update_time = now
+        self._debt_tick = now
+        self.stop_beep_warning()
+        if now - self._pause_last_save >= 10:
+            self._pause_last_save = now
+            self.save_break_state()
+
+    def update_own_state(self, force=False):
+        """Пишет %ProgramData%\\VeloController\\state.json: idle / riding / blocking."""
+        now = time.time()
+        if self.is_locked:
+            state = 'blocking'
+        elif now - self.last_leg_movement_time < 5 and now - self.last_data_time < 3:
+            state = 'riding'
+        else:
+            state = 'idle'
+        if not force and state == self._own_state and now - self._own_state_at < vt.OWN_STATE_WRITE_SEC:
+            return
+        try:
+            vt.write_own_state(state)
+            self._own_state, self._own_state_at = state, now
+        except Exception as e:
+            self._own_state_at = now          # не пытаться чаще, чем раз в интервал
+            if self._own_state != 'error':
+                logging.warning(f"Не удалось записать файл состояния: {e}")
+            self._own_state = 'error'
+
     def show_done_gauge(self):
         """Норма выполнена, но поздравление ждёт паузы: спокойный зелёный кружок без сигналов."""
         self.enter_gauge_mode()
@@ -1858,6 +2044,23 @@ class PedalController:
         # Смена даты должна обрабатываться даже без данных от Arduino.
         self.check_date_change()
 
+        # Обмен состоянием с тренажёром: во время занятия велоконтроллер стоит на паузе.
+        self.poll_trainer()
+        self.update_own_state()
+        if self._start_wait:
+            # Программа запущена, когда ребёнок играет: не показываемся, пока он не сделает паузу.
+            if self.start_gate_open():
+                self._start_wait = False
+                self._quiet_show()
+                logging.info("Пауза в игре: показываю велоконтроллер после запуска")
+            else:
+                self.schedule_gui_update()
+                return
+        if self.paused_by_trainer:
+            self.run_trainer_pause()
+            self.schedule_gui_update()
+            return
+
         # Норматив выполнен: идёт праздник, затем приложение скрыто до завтра.
         if self.celebration is not None:
             self.schedule_gui_update()
@@ -1890,7 +2093,7 @@ class PedalController:
             self.show_from_hidden()
 
         # Приветствие с историей при запуске программы - даже в режиме свободного времени.
-        if self.startup_welcome_due and not self.is_locked:
+        if self.startup_welcome_due and not self.is_locked and self.start_gate_open():
             self.startup_welcome_due = False
             self.show_welcome()
 
@@ -1935,7 +2138,7 @@ class PedalController:
             return
 
         # Свободный промежуток из настроек: как выходной, но только на заданные часы.
-        if self.is_free_window_now():
+        if self.is_free_period():
             self._in_free_window = True
             self.stop_beep_warning()
             self.alert_window_start_time = None
@@ -1944,7 +2147,7 @@ class PedalController:
             self.load_label.config(text=f"Нагр: {self.current_load} / мин: {self.min_load}")
             self.pulses_label.config(text=f"{self.session_pulses}")
             self.daily_progress_label.config(text="Свободное время")
-            until = ft.free_until(self.free_windows, datetime.now())
+            until = ft.free_until(self.free_windows, datetime.now()) or "паузы в игре"
             self.break_timer_label.config(text=f"Без нагрузки до {until}", fg="green")
             self.beep_timer_label.config(text="Отдых", fg="green")
             self.status_label.config(text="Свободное время")
@@ -2084,7 +2287,7 @@ class PedalController:
             
             # Приветствие с историей - до начала вращения
             if (self.welcome_pending and self.current_speed <= 0
-                    and time.time() - self.last_leg_movement_time >= 3):
+                    and time.time() - self.last_leg_movement_time >= 3 and self.start_gate_open()):
                 self.show_welcome()
 
             # ========== ПРОВЕРКИ ДЛЯ АКТИВНОГО РЕЖИМА ==========
@@ -2599,6 +2802,23 @@ class PedalController:
 
         tk.Button(name_frame, text="Показать пример", command=preview_cheer).pack(side=tk.LEFT, padx=8)
 
+        start_idle_frame = tk.Frame(lock_frame, bg=bg_color)
+        start_idle_frame.pack(fill=tk.X, pady=5)
+
+        tk.Label(
+            start_idle_frame,
+            text="Старт контроля после паузы:",
+            font=("Arial", 9),
+            bg=bg_color,
+            width=22,
+            anchor="w"
+        ).pack(side=tk.LEFT)
+
+        start_idle_var = tk.StringVar(value=str(self.start_idle_sec))
+        tk.Entry(start_idle_frame, textvariable=start_idle_var, font=("Arial", 11), width=10).pack(side=tk.LEFT)
+        tk.Label(start_idle_frame, text=f"сек без клавиатуры и мыши ({CHEER_IDLE_MIN_SEC}-{CHEER_IDLE_MAX_SEC})",
+                 font=("Arial", 11), bg=bg_color).pack(side=tk.LEFT, padx=5)
+
         cheer_idle_frame = tk.Frame(lock_frame, bg=bg_color)
         cheer_idle_frame.pack(fill=tk.X, pady=5)
 
@@ -2816,6 +3036,7 @@ class PedalController:
                 new_child_name = child_name_var.get().strip()[:30] or DEFAULT_CHILD_NAME
                 new_cheer_idle = int(cheer_idle_var.get())
                 new_debt = float(debt_var.get().replace(',', '.'))
+                new_start_idle = int(start_idle_var.get())
                 new_schedule = {key: variable.get() for key, variable in schedule_vars.items()}
 
                 if new_speed < 0:
@@ -2878,6 +3099,14 @@ class PedalController:
                     )
                     return
 
+                if new_start_idle < CHEER_IDLE_MIN_SEC or new_start_idle > CHEER_IDLE_MAX_SEC:
+                    messagebox.showerror(
+                        "Ошибка",
+                        f"Пауза перед стартом контроля должна быть {CHEER_IDLE_MIN_SEC}-{CHEER_IDLE_MAX_SEC} сек!",
+                        parent=settings_window
+                    )
+                    return
+
                 if new_debt < DEBT_RECOVERY_MIN or new_debt > DEBT_RECOVERY_MAX:
                     messagebox.showerror(
                         "Ошибка",
@@ -2890,6 +3119,7 @@ class PedalController:
                 self.gauge_size = new_gauge_size
                 self.cheer_idle_sec = new_cheer_idle
                 self.debt_recovery = new_debt
+                self.start_idle_sec = new_start_idle
                 self.wheel_inches = new_wheel
                 self.child_name = new_child_name
 
@@ -3145,7 +3375,8 @@ class PedalController:
     def start_beep_warning(self):
         logging.debug(f"start_beep_warning: вызван, is_locked={self.is_locked}, is_beeping={self.is_beeping}, is_limit_reached={self.is_limit_reached_today}, is_break_mode={self.is_break_mode}")
         if (self.is_locked or self.is_limit_reached_today or self.is_break_mode
-                or self.is_manual_pause_active() or not self.is_today_scheduled()):
+                or self.is_manual_pause_active() or not self.is_today_scheduled()
+                or self.paused_by_trainer or self._start_wait):
             logging.debug("start_beep_warning: условия блокировки - не запускаю писк")
             return
         if self.is_beeping:
@@ -3155,7 +3386,8 @@ class PedalController:
 
     def _schedule_beep(self):
         if (self.is_locked or self.is_limit_reached_today or self.is_break_mode
-                or self.is_manual_pause_active() or not self.is_today_scheduled()):
+                or self.is_manual_pause_active() or not self.is_today_scheduled()
+                or self.paused_by_trainer):
             logging.debug("_schedule_beep: заблокировано, лимит или режим ожидания - отмена писка")
             self.is_beeping = False
             self._beep_after_id = None
@@ -3220,7 +3452,9 @@ class PedalController:
                 or self.is_break_mode
                 or self.is_manual_pause_active()
                 or not self.is_today_scheduled()
-                or self.is_free_window_now()
+                or self.is_free_period()
+                or self.paused_by_trainer
+                or self._start_wait
                 or self.is_password_window_open):
             logging.info(
                 "Блокировка отменена: locked=%s, limit=%s, break=%s, pause=%s, scheduled=%s, password=%s",
@@ -3238,6 +3472,7 @@ class PedalController:
         logging.debug("lock_computer: Устанавливаю is_locked = True")
         self.is_locked = True
         self.close_welcome()
+        self.update_own_state(force=True)
 
         logging.debug("lock_computer: вызываю stop_beep_warning")
         self.stop_beep_warning()
@@ -3406,6 +3641,10 @@ class PedalController:
 
         self.is_running = False
         self.stop_beep_warning()
+        try:
+            vt.write_own_state('idle')
+        except Exception:
+            pass
 
         try:
             self.save_daily_stats()

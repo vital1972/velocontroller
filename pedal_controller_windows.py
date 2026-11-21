@@ -40,6 +40,9 @@ MIN_IDLE_TIMEOUT_SEC = 10
 CHEER_IDLE_DEFAULT_SEC = 5   # пауза без клавиатуры и мыши перед поздравлением
 CHEER_IDLE_MIN_SEC = 1
 CHEER_IDLE_MAX_SEC = 120
+DEBT_RECOVERY_DEFAULT = 0.5  # сколько секунд паузы гасит 1 секунда нормального кручения
+DEBT_RECOVERY_MIN = 0.1
+DEBT_RECOVERY_MAX = 20.0
 MIN_DAILY_LIMIT_MIN = 1
 MIN_BREAK_MINUTES = 1  # минимальное время режима ожидания
 MAX_BREAK_MINUTES = 480  # максимальное (8 часов)
@@ -251,6 +254,9 @@ class PedalController:
 
         self.program_start_time = time.time()
         self.last_activity_time = time.time()
+        self.slow_debt = 0.0          # накопленная «пауза» в секундах (отрицательная - запас)
+        self._debt_tick = time.time()
+        self.debt_recovery = DEBT_RECOVERY_DEFAULT
         self.last_data_received_time = time.time()
         self.last_leg_movement_time = time.time()
 
@@ -622,6 +628,7 @@ class PedalController:
         self.pending_break_start_date = None
         self.break_date = time.strftime("%Y-%m-%d")
         self.last_activity_time = now
+        self.slow_debt = 0.0
         self.last_leg_movement_time = now
         self.alert_window_start_time = None
         self.stop_beep_warning()
@@ -639,6 +646,7 @@ class PedalController:
         self.warning_time = None
         self.pending_break_start_date = None
         self.last_activity_time = now
+        self.slow_debt = 0.0
         self.last_leg_movement_time = now
         self.alert_window_start_time = None
         self.restore_window()
@@ -823,6 +831,7 @@ class PedalController:
             'free_windows': [],
             'child_name': DEFAULT_CHILD_NAME,
             'cheer_idle_sec': CHEER_IDLE_DEFAULT_SEC,
+            'debt_recovery': DEBT_RECOVERY_DEFAULT,
             'schedule': DEFAULT_SCHEDULE.copy()
         }
 
@@ -848,6 +857,8 @@ class PedalController:
                 self.child_name = str(config.get('child_name', DEFAULT_CHILD_NAME)).strip()[:30] or DEFAULT_CHILD_NAME
                 self.cheer_idle_sec = max(CHEER_IDLE_MIN_SEC, min(CHEER_IDLE_MAX_SEC, int(
                     config.get('cheer_idle_sec', default_config['cheer_idle_sec']))))
+                self.debt_recovery = max(DEBT_RECOVERY_MIN, min(DEBT_RECOVERY_MAX, float(
+                    config.get('debt_recovery', default_config['debt_recovery']))))
                 saved_schedule = config.get('schedule', {})
                 self.schedule = {
                     key: bool(saved_schedule.get(key, default_config['schedule'][key]))
@@ -893,6 +904,7 @@ class PedalController:
                 self.free_windows = []
                 self.child_name = DEFAULT_CHILD_NAME
                 self.cheer_idle_sec = CHEER_IDLE_DEFAULT_SEC
+                self.debt_recovery = DEBT_RECOVERY_DEFAULT
                 self.schedule = default_config['schedule'].copy()
                 self.save_config()
                 logging.info("Используются настройки по умолчанию")
@@ -909,6 +921,7 @@ class PedalController:
             self.free_windows = []
             self.child_name = DEFAULT_CHILD_NAME
             self.cheer_idle_sec = CHEER_IDLE_DEFAULT_SEC
+            self.debt_recovery = DEBT_RECOVERY_DEFAULT
             self.schedule = default_config['schedule'].copy()
 
     def save_config(self):
@@ -926,6 +939,7 @@ class PedalController:
                 'free_windows': self.free_windows,
                 'child_name': self.child_name,
                 'cheer_idle_sec': self.cheer_idle_sec,
+                'debt_recovery': self.debt_recovery,
                 'schedule': self.schedule
             }
 
@@ -1372,8 +1386,6 @@ class PedalController:
             speed_check = rpm_check * self.wheel_circumference * 0.06
             load_check = self.current_load
 
-            if speed_check >= self.min_speed and load_check >= self.min_load:
-                self.last_activity_time = current_time
 
         if act > 0:
             self.last_leg_movement_time = current_time
@@ -1633,12 +1645,28 @@ class PedalController:
         x, y = clamp_to_screen(*self._saved_pos, self.window_normal_width, self.window_normal_height)
         self.root.geometry(f"+{x}+{y}")
 
+    def update_slow_debt(self):
+        """Копит «паузу» при медленном кручении; нормальное кручение гасит её медленнее.
+
+        Один быстрый рывок больше не обнуляет отсчёт блокировки: секунда нормального
+        кручения снимает только debt_recovery секунд накопленной паузы.
+        """
+        now = time.time()
+        dt = max(0.0, min(now - self._debt_tick, 1.0))
+        self._debt_tick = now
+        has_data = (now - self.last_data_time) < 3
+        ok = has_data and self.current_speed >= self.min_speed and self.current_load >= self.min_load
+        if not ok:
+            self.slow_debt += dt
+        elif self.slow_debt > 0:
+            self.slow_debt = max(0.0, self.slow_debt - dt * self.debt_recovery)
+
     def show_gauge(self, ok, time_since_movement):
         """Показывает и обновляет спидометр во время вращения педалей."""
         self.enter_gauge_mode()
         self.alert_window_start_time = None
 
-        idle_time = max(0.0, time.time() - self.last_activity_time)
+        idle_time = max(0.0, self.slow_debt)
         lock_frac = min(1.0, idle_time / max(1, self.idle_timeout))
         moving = self.current_speed > 0 or time_since_movement < 3
 
@@ -1927,6 +1955,7 @@ class PedalController:
             # Промежуток закончился: даём минуту на то, чтобы начать крутить, и показываем приветствие.
             self._in_free_window = False
             self.last_activity_time = time.time() + 60
+            self.slow_debt = -60.0
             self.welcome_pending = True
 
         # Обновляем состояние режима ожидания
@@ -2044,8 +2073,8 @@ class PedalController:
             # Проверка на блокировку (только если не в режиме ожидания)
             if (not self.is_limit_reached_today and not self.is_password_window_open
                     and not self.is_break_mode and not self.is_manual_pause_active()):
-                idle_time = time.time() - self.last_activity_time
-                if idle_time >= self.idle_timeout:
+                self.update_slow_debt()
+                if self.slow_debt >= self.idle_timeout:
                     self.lock_computer()
                     return
             else:
@@ -2490,6 +2519,26 @@ class PedalController:
         timeout_entry.pack(side=tk.LEFT)
         tk.Label(timeout_frame, text="сек", font=("Arial", 11), bg=bg_color).pack(side=tk.LEFT, padx=5)
 
+        debt_frame = tk.Frame(lock_frame, bg=bg_color)
+        debt_frame.pack(fill=tk.X, pady=5)
+
+        tk.Label(
+            debt_frame,
+            text="Погашение паузы:",
+            font=("Arial", 9),
+            bg=bg_color,
+            width=22,
+            anchor="w"
+        ).pack(side=tk.LEFT)
+
+        debt_var = tk.StringVar(value=f"{self.debt_recovery:g}")
+        tk.Entry(debt_frame, textvariable=debt_var, font=("Arial", 11), width=10).pack(side=tk.LEFT)
+        tk.Label(
+            debt_frame,
+            text=f"с паузы за 1 с нормального кручения ({DEBT_RECOVERY_MIN:g}-{DEBT_RECOVERY_MAX:g})",
+            font=("Arial", 11), bg=bg_color
+        ).pack(side=tk.LEFT, padx=5)
+
         gauge_frame = tk.Frame(lock_frame, bg=bg_color)
         gauge_frame.pack(fill=tk.X, pady=5)
 
@@ -2766,6 +2815,7 @@ class PedalController:
                 new_wheel = float(wheel_var.get().replace(',', '.'))
                 new_child_name = child_name_var.get().strip()[:30] or DEFAULT_CHILD_NAME
                 new_cheer_idle = int(cheer_idle_var.get())
+                new_debt = float(debt_var.get().replace(',', '.'))
                 new_schedule = {key: variable.get() for key, variable in schedule_vars.items()}
 
                 if new_speed < 0:
@@ -2828,9 +2878,18 @@ class PedalController:
                     )
                     return
 
+                if new_debt < DEBT_RECOVERY_MIN or new_debt > DEBT_RECOVERY_MAX:
+                    messagebox.showerror(
+                        "Ошибка",
+                        f"Погашение паузы должно быть {DEBT_RECOVERY_MIN:g}-{DEBT_RECOVERY_MAX:g}!",
+                        parent=settings_window
+                    )
+                    return
+
                 old_limit_reached = self.is_limit_reached_today
                 self.gauge_size = new_gauge_size
                 self.cheer_idle_sec = new_cheer_idle
+                self.debt_recovery = new_debt
                 self.wheel_inches = new_wheel
                 self.child_name = new_child_name
 
@@ -3222,6 +3281,8 @@ class PedalController:
         self.is_locked = False
 
         self.last_activity_time = time.time() + 60
+
+        self.slow_debt = -60.0
         self.last_daily_update_time = time.time()
         self.check_date_change()
         self.maybe_start_pending_break(reason="первый вход пользователя после разблокировки")
@@ -3260,7 +3321,7 @@ class PedalController:
                 pass
             return
 
-        self.idle_time_at_password = time.time() - self.last_activity_time
+        self.idle_time_at_password = self.slow_debt
 
         self.password_window = tk.Toplevel(self.root)
         self.password_window.title("Ввод пароля")
@@ -3410,7 +3471,7 @@ class PedalController:
                         continue
 
                     if self.arduino_was_connected and (not self.arduino or not self.arduino.is_open):
-                        idle_time = current_time - self.last_activity_time
+                        idle_time = self.slow_debt
 
                         if self.is_limit_reached_today:
                             logging.info("Дневной лимит достигнут, блокировка не требуется")

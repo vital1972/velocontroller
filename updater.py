@@ -113,28 +113,56 @@ def clean_child_env(environ=None):
     return env
 
 
-def apply_staged(staged, target_exe=None):
-    """Запускает отдельный скрипт: после выхода программы подменяет exe и запускает новый."""
-    target_exe = target_exe or sys.executable
-    script = os.path.join(tempfile.gettempdir(), "velocontroller_update.bat")
+def _plain_path(path):
+    """Обычный путь без расширенного префикса (cmd его не понимает)."""
+    bs = chr(92)
+    path = os.path.abspath(path)
+    if path.startswith(bs * 2 + "?" + bs + "UNC" + bs):
+        path = bs * 2 + path[8:]
+    elif path.startswith(bs * 2 + "?" + bs):
+        path = path[4:]
+    return path
+
+
+def build_update_script(staged, target_exe, log_path):
+    """Текст .bat: ждёт выхода программы, подменяет exe, запускает новый и пишет журнал."""
     lines = [
         "@echo off",
         "set /a tries=0",
+        f'echo %date% %time% start update >> "{log_path}"',
         ":retry",
         "set /a tries+=1",
         "if %tries% GTR 60 goto fail",
-        "timeout /t 2 /nobreak >nul",
+        # ping вместо timeout: timeout без консоли не ждёт
+        "ping -n 3 127.0.0.1 >nul",
         f'move /Y "{staged}" "{target_exe}" >nul 2>&1',
         "if errorlevel 1 goto retry",
-        f'start "" "{target_exe}"',
+        f'echo %date% %time% replaced after %tries% tries >> "{log_path}"',
+        f'if not exist "{target_exe}" goto missing',
+        f'start "" /d "{os.path.dirname(target_exe)}" "{target_exe}"',
+        f'echo %date% %time% started >> "{log_path}"',
+        "goto end",
+        ":missing",
+        f'echo %date% %time% target missing after move >> "{log_path}"',
         "goto end",
         ":fail",
+        f'echo %date% %time% gave up >> "{log_path}"',
         f'del "{staged}" >nul 2>&1',
         ":end",
         '(goto) 2>nul & del "%~f0"',
     ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def apply_staged(staged, target_exe=None):
+    """Запускает отдельный скрипт: после выхода программы подменяет exe и запускает новый."""
+    target_exe = _plain_path(target_exe or sys.executable)
+    staged = _plain_path(staged)
+    temp = _plain_path(tempfile.gettempdir())
+    script = os.path.join(temp, "velocontroller_update.bat")
+    log_path = os.path.join(temp, "velocontroller_update.log")
     with open(script, "w", encoding="cp866", errors="replace") as f:
-        f.write("\r\n".join(lines) + "\r\n")
+        f.write(build_update_script(staged, target_exe, log_path))
 
     DETACHED_PROCESS = 0x00000008
     CREATE_NO_WINDOW = 0x08000000

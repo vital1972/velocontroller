@@ -99,6 +99,20 @@ def check_and_stage(repo, current_version, target_exe=None):
     return staged
 
 
+def clean_child_env(environ=None):
+    """Окружение для перезапуска программы из самой себя.
+
+    Собранный PyInstaller exe кладёт в окружение переменные _PYI_* / _MEIPASS2 со ссылкой на
+    свою временную папку. Если новый exe, запущенный из старого, их унаследует, он решит, что
+    это тот же процесс, и попытается загрузить python312.dll из уже удалённой папки
+    (ошибка «Failed to load Python DLL»). Поэтому их убираем и просим загрузчик сбросить состояние.
+    """
+    env = {k: v for k, v in (environ if environ is not None else os.environ).items()
+           if k != '_MEIPASS2' and not k.startswith('_PYI')}
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    return env
+
+
 def apply_staged(staged, target_exe=None):
     """Запускает отдельный скрипт: после выхода программы подменяет exe и запускает новый."""
     target_exe = target_exe or sys.executable
@@ -125,5 +139,5 @@ def apply_staged(staged, target_exe=None):
     DETACHED_PROCESS = 0x00000008
     CREATE_NO_WINDOW = 0x08000000
     subprocess.Popen(["cmd.exe", "/c", script], creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
-                     close_fds=True)
+                     close_fds=True, env=clean_child_env())
     logging.info("Запущен скрипт замены exe, программа завершается для обновления")

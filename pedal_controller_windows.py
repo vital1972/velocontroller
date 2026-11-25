@@ -45,7 +45,8 @@ DEBT_RECOVERY_DEFAULT = 0.5  # сколько секунд паузы гасит
 DEBT_RECOVERY_MIN = 0.1
 DEBT_RECOVERY_MAX = 20.0
 START_IDLE_DEFAULT_SEC = 5   # пауза без клавиатуры и мыши перед стартом контроля
-TRAINER_PAUSE_MAX_SEC = 1800  # страховка: одна сессия тренажёра не держит паузу дольше 30 минут
+TRAINER_END_WAIT_SEC = 10     # после конца занятия ждём паузы в вводе не дольше этого (клавиши тренажёра не считаются игрой)
+TRAINER_PAUSE_MAX_SEC = 1800 # страховка: одна сессия тренажёра не держит паузу дольше 30 минут
 MIN_DAILY_LIMIT_MIN = 1
 MIN_BREAK_MINUTES = 1  # минимальное время режима ожидания
 MAX_BREAK_MINUTES = 480  # максимальное (8 часов)
@@ -324,6 +325,7 @@ class PedalController:
         self.start_idle_sec = START_IDLE_DEFAULT_SEC
         self._start_wait = False
         self._pause_ending = False
+        self._pause_ending_since = 0.0
         self._quiet_hidden = False
         self.paused_by_trainer = False
         self._trainer_poll_at = 0.0
@@ -1786,10 +1788,13 @@ class PedalController:
         if want_pause and not self.paused_by_trainer:
             self._pause_begin(sid)
         elif not want_pause and self.paused_by_trainer:
-            if not self.start_gate_open() and now - self._pause_started <= TRAINER_PAUSE_MAX_SEC:
-                # Занятие кончилось, но ребёнок играет: не врываемся, ждём паузы в игре.
+            if not self._pause_ending:
+                self._pause_ending_since = now
+            if (not self.start_gate_open() and now - self._pause_started <= TRAINER_PAUSE_MAX_SEC
+                    and now - self._pause_ending_since <= TRAINER_END_WAIT_SEC):
+                # Занятие кончилось, но ребёнок ещё жмёт клавиши: недолго ждём паузы в игре.
                 if not self._pause_ending:
-                    logging.info(f"Занятие закончено, жду паузы в игре, session_id={self._pause_session}")
+                    logging.info(f"Занятие закончено, жду паузы в игре до {TRAINER_END_WAIT_SEC} с, session_id={self._pause_session}")
                 self._pause_ending = True
                 return
             reason = {vt.STALE: "heartbeat устарел (тренажёр закрыт?)", vt.NONE: "файл исчез",
@@ -1819,6 +1824,7 @@ class PedalController:
         seconds = time.time() - self._pause_started
         self.paused_by_trainer = False
         self._pause_ending = False
+        self._pause_ending_since = 0.0
         self._pause_session = None
         self._quiet_show()
         now = time.time()
